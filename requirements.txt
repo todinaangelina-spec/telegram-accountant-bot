@@ -1,0 +1,13 @@
+aiogram>=3.22,<4
+openai>=2.0,<3
+pydantic>=2.10,<3
+python-dotenv>=1.0,<2
+SQLAlchemy>=2.0.40,<2.1
+psycopg[binary]>=3.2,<4
+openpyxl>=3.1.5,<4
+python-docx>=1.1.2,<2
+pypdf>=6.0,<7
+pypdfium2>=4.30,<6
+Pillow>=11.0,<13
+pytest>=8,<10
+pytest-asyncio>=0.24,<2
