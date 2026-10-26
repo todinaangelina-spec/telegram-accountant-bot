@@ -7,8 +7,11 @@ from io import BytesIO
 from typing import Any, Iterable
 
 from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+from accounting import parse_money
 
 from domain import DocumentData, TableData
 
@@ -192,6 +195,73 @@ def document_xlsx(data: DocumentData) -> bytes:
         _set_width(warnings_sheet, 1, 50)
         warnings_sheet.freeze_panes = "A2"
     _write_overflow_sheet(workbook, used, overflow)
+    return _save_workbook(workbook)
+
+
+def chart_xlsx(table: TableData, category_column: int, value_column: int) -> bytes:
+    """Create an Excel workbook with source rows and a bar chart.
+
+    Column arguments are zero-based. Chart values are for visual inspection only;
+    this function never aggregates or changes the accounting journal.
+    """
+    table = TableData.model_validate(table)
+    if not 0 <= category_column < len(table.columns):
+        raise ValueError("Не найден столбец категорий")
+    if not 0 <= value_column < len(table.columns):
+        raise ValueError("Не найден числовой столбец")
+    if category_column == value_column:
+        raise ValueError("Выберите разные столбцы для подписей и чисел")
+    if not table.rows:
+        raise ValueError("В таблице нет строк для графика")
+    if len(table.rows) > 200:
+        raise ValueError("Для графика допускается до 200 строк. Сначала сократите таблицу.")
+
+    workbook, data_sheet, used = _new_workbook("Данные графика")
+    for column, heading in enumerate(table.columns, start=1):
+        _write_string_cell(data_sheet, 1, column, heading, [], f"Данные графика!{column}1")
+    _style_header(data_sheet[1])
+
+    for row_number, values in enumerate(table.rows, start=2):
+        for column_number, raw in enumerate(values, start=1):
+            if column_number - 1 == value_column:
+                try:
+                    number = parse_money(raw)
+                except ValueError:
+                    raise ValueError(
+                        f"Строка {row_number - 1}: значение «{raw[:80]}» в столбце "
+                        f"«{table.columns[value_column]}» не распознано как однозначное число."
+                    ) from None
+                cell = data_sheet.cell(row=row_number, column=column_number, value=float(number))
+                cell.number_format = "0.00"
+            else:
+                _write_string_cell(
+                    data_sheet, row_number, column_number, raw, [],
+                    f"Данные графика!{column_number}:{row_number}",
+                )
+
+    chart = BarChart()
+    chart.type = "bar"
+    chart.style = 10
+    chart.title = f"{table.name[:100]}: {table.columns[value_column][:60]}"
+    chart.x_axis.title = table.columns[category_column][:80]
+    chart.y_axis.title = table.columns[value_column][:80]
+    values = Reference(data_sheet, min_col=value_column + 1, min_row=1, max_row=len(table.rows) + 1)
+    categories = Reference(data_sheet, min_col=category_column + 1, min_row=2, max_row=len(table.rows) + 1)
+    chart.add_data(values, titles_from_data=True)
+    chart.set_categories(categories)
+    chart.height = 10
+    chart.width = 20
+    chart.legend = None
+
+    chart_sheet = workbook.create_sheet(_sheet_name("График", used, "График"))
+    chart_sheet.add_chart(chart, "A1")
+    data_sheet.freeze_panes = "A2"
+    data_sheet.auto_filter.ref = data_sheet.dimensions
+    note = workbook.create_sheet(_sheet_name("Примечание", used, "Примечание"))
+    note.append(["График показывает строки таблицы без группировки и без добавления записей в журнал."])
+    note.append(["Числовой столбец преобразован в числовой формат Excel только для построения диаграммы."])
+    note.append(["Сверьте исходные значения, единицы измерения, валюту и наличие строк «Итого»."])
+    _set_width(note, 1, 100)
     return _save_workbook(workbook)
 
 

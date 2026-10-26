@@ -16,13 +16,20 @@ from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BotCommand, BufferedInputFile, Message, TelegramObject
+from aiogram.types import (
+    BotCommand,
+    BufferedInputFile,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    TelegramObject,
+)
 
 from accounting import money_text, parse_money, safe_calculate, vat
 from ai_service import AIService
 from config import Settings
 from domain import DocumentData
-from exports import document_xlsx, ledger_xlsx
+from exports import chart_xlsx, document_xlsx, ledger_xlsx
 from ingest import ParsedSource, parse_file, parse_text
 from storage import Repository
 
@@ -36,6 +43,7 @@ HELP = """Помощник по управленческому учёту
 /ask вопрос — ответить по выбранным документам и сводке журнала.
 /table ID — сделать таблицу из сохранённого текста с помощью ИИ.
 /export ID — выгрузить документ в Excel.
+/chart ID ТАБЛИЦА СТОЛБЕЦ_КАТЕГОРИИ СТОЛБЕЦ_ЧИСЛА — Excel-график.
 /sum ID номер_таблицы номер_столбца — точная сумма столбца (нумерация с 1).
 
 Учёт (только ручные записи, автоматических проводок нет):
@@ -57,6 +65,28 @@ HELP = """Помощник по управленческому учёту
 Без согласия работают локальные таблицы, журнал и расчёты.
 Фото/сканы требуют ИИ. Извлечённые числа надо сверять с оригиналом.
 Это не полноценная регламентированная бухгалтерская система."""
+
+MENU_UPLOAD = "Загрузить файл"
+MENU_DOCS = "Мои документы"
+MENU_TABLE = "Сделать таблицу / Excel"
+MENU_CHART = "Построить график"
+MENU_ASK = "Спросить ИИ"
+MENU_REVIEW = "Проверить таблицу"
+MENU_REPORT = "Финансовый отчёт"
+MENU_PRIVACY = "Приватность"
+MENU_HELP = "Помощь"
+MAIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=MENU_UPLOAD), KeyboardButton(text=MENU_DOCS)],
+        [KeyboardButton(text=MENU_TABLE), KeyboardButton(text=MENU_CHART)],
+        [KeyboardButton(text=MENU_ASK), KeyboardButton(text=MENU_REVIEW)],
+        [KeyboardButton(text=MENU_REPORT), KeyboardButton(text=MENU_PRIVACY)],
+        [KeyboardButton(text=MENU_HELP)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Нажмите кнопку или задайте вопрос",
+)
 
 
 async def send_text(message: Message, text: str):
@@ -228,13 +258,51 @@ class Application:
     def bind(self):
         r = self.router
 
-        @r.message(Command("start", "help"))
+        async def table_action(message: Message, ident: str | None = None):
+            owner = message.from_user.id
+            doc = await self.get_doc(owner, ident)
+            data = doc["data"]
+            if data.tables:
+                payload = await asyncio.to_thread(document_xlsx, data)
+                await message.answer_document(
+                    BufferedInputFile(payload, filename=f"document_{doc['id']}.xlsx"),
+                    caption=f"Таблицы документа #{doc['id']} в Excel."
+                )
+                return
+            await self.require_ai(owner)
+            source = ParsedSource(filename=doc["filename"], text=data.text, tables=[],
+                                  images=[], warnings=data.warnings)
+            await self.save_source(message, source)
+
+        async def chart_action(message: Message, args: str | None):
+            try:
+                ident, table_number, category_column, value_column = map(
+                    int, (args or "").split())
+            except ValueError:
+                raise ValueError(
+                    "Пример: /chart 7 1 1 3 — документ 7, таблица 1, "
+                    "столбец категорий 1, числовой столбец 3 (нумерация с 1)."
+                ) from None
+            doc = await self.get_doc(message.from_user.id, str(ident))
+            tables = doc["data"].tables
+            if not 1 <= table_number <= len(tables):
+                raise ValueError("Неверный номер таблицы. Посмотрите список через /docs и /export ID")
+            table = tables[table_number - 1]
+            payload = await asyncio.to_thread(
+                chart_xlsx, table, category_column - 1, value_column - 1)
+            await message.answer_document(
+                BufferedInputFile(payload, filename=f"chart_{ident}_{table_number}.xlsx"),
+                caption="График и исходные строки в Excel. Проверьте единицы измерения и строки «Итого»."
+            )
+
+        @r.message(Command("start", "help", "menu"))
         async def start(message: Message):
-            await send_text(message, HELP)
+            await message.answer(HELP, reply_markup=MAIN_MENU, parse_mode=None)
             await message.answer(
                 "ИИ выключен, пока вы не дали согласие. /consent разрешает передавать "
                 "внешнему провайдеру вопросы, выбранные фрагменты документов, сводку журнала "
-                "и изображения при распознавании. API может быть платным. Подробности: /privacy.")
+                "и изображения при распознавании. API может быть платным. Подробности: /privacy.",
+                reply_markup=MAIN_MENU)
 
         @r.message(Command("privacy"))
         async def privacy(message: Message):
@@ -275,6 +343,10 @@ class Application:
             await send_text(message, "Последние 30 документов:\n" + (
                 "\n".join(f"#{d['id']} — {d['title'][:150]} ({d['filename'][:80]})" for d in documents)
                 if documents else "Пока нет документов."))
+
+        @r.message(F.text == MENU_DOCS)
+        async def docs_button(message: Message):
+            await docs(message)
 
         @r.message(Command("use"))
         async def use(message: Message, command: CommandObject):
@@ -324,24 +396,17 @@ class Application:
 
         @r.message(Command("table"))
         async def make_table(message: Message, command: CommandObject):
-            owner = message.from_user.id
-            doc = await self.get_doc(owner, command.args)
-            data = doc["data"]
-            if data.tables:
-                await message.answer("В этом документе уже есть таблицы. Отправляю Excel.")
-                payload = await asyncio.to_thread(document_xlsx, data)
-                await message.answer_document(BufferedInputFile(payload, filename=f"document_{doc['id']}.xlsx"))
-                return
-            await self.require_ai(owner)
-            source = ParsedSource(filename=doc["filename"], text=data.text, tables=[],
-                                  images=[], warnings=data.warnings)
-            await self.save_source(message, source)
+            await table_action(message, command.args)
 
         @r.message(Command("export"))
         async def export(message: Message, command: CommandObject):
             doc = await self.get_doc(message.from_user.id, command.args)
             payload = await asyncio.to_thread(document_xlsx, doc["data"])
             await message.answer_document(BufferedInputFile(payload, filename=f"document_{doc['id']}.xlsx"))
+
+        @r.message(Command("chart"))
+        async def chart(message: Message, command: CommandObject):
+            await chart_action(message, command.args)
 
         @r.message(Command("sum"))
         async def sum_column(message: Message, command: CommandObject):
@@ -457,6 +522,65 @@ class Application:
                 self.selected.pop(owner, None)
             await message.answer("Документ удалён." if deleted else "Документ уже отсутствует.")
 
+        @r.message(F.text == MENU_UPLOAD)
+        async def upload_button(message: Message):
+            await message.answer(
+                "Прикрепите сюда фото или файл как документ. Поддерживаются PDF, DOCX, XLSX, "
+                "CSV, TXT, JSON, JPG, PNG и WEBP. Фото, сканы и текстовые PDF требуют "
+                "настроенного ИИ и согласия /consent."
+            )
+
+        @r.message(F.text == MENU_TABLE)
+        async def table_button(message: Message):
+            await table_action(message)
+
+        @r.message(F.text == MENU_CHART)
+        async def chart_button(message: Message):
+            doc = await self.get_doc(message.from_user.id)
+            if not doc["data"].tables:
+                raise ValueError(f"В документе #{doc['id']} таблиц пока нет. Попробуйте /table {doc['id']}.")
+            lines = [f"Выбран документ #{doc['id']}. Номера столбцов начинаются с 1."]
+            for number, table in enumerate(doc["data"].tables, 1):
+                columns = "; ".join(f"{i}. {name}" for i, name in enumerate(table.columns, 1))
+                lines.append(f"Таблица {number} «{table.name}»: {columns}")
+            lines.append(
+                f"Для графика отправьте: /chart {doc['id']} НОМЕР_ТАБЛИЦЫ "
+                "СТОЛБЕЦ_КАТЕГОРИИ СТОЛБЕЦ_ЧИСЕЛ\nПример: /chart "
+                f"{doc['id']} 1 1 3"
+            )
+            await message.answer("\n".join(lines))
+
+        @r.message(F.text == MENU_ASK)
+        async def ask_button(message: Message):
+            await message.answer(
+                "Напишите следующим сообщением вопрос по выбранному файлу. "
+                "Чтобы выбрать источник, используйте /use ID или /use all."
+            )
+
+        @r.message(F.text == MENU_REVIEW)
+        async def review_button(message: Message):
+            await self.ask(
+                message,
+                "Проверь выбранный документ или таблицу на возможные пропуски, дубликаты, "
+                "повторные заголовки, неоднозначные форматы дат/чисел, несовпадение валют "
+                "и единиц. Раздели факты из документа и рекомендации. Укажи источники; "
+                "предложи, что можно исправить или уточнить, но ничего не меняй автоматически. "
+                "Если контекста недостаточно для проверки всего файла, скажи об этом.",
+            )
+
+        @r.message(F.text == MENU_REPORT)
+        async def report_button(message: Message):
+            summary = await self.db("summary", message.from_user.id)
+            await message.answer(report_text(summary))
+
+        @r.message(F.text == MENU_PRIVACY)
+        async def privacy_button(message: Message):
+            await privacy(message)
+
+        @r.message(F.text == MENU_HELP)
+        async def help_button(message: Message):
+            await start(message)
+
         @r.message(F.text & ~F.text.startswith("/"))
         async def normal_question(message: Message):
             await self.ask(message, message.text)
@@ -485,9 +609,11 @@ async def main():
     dispatcher.include_router(application.router)
     try:
         await bot.set_my_commands([
+            BotCommand(command="menu", description="Открыть кнопочное меню"),
             BotCommand(command="help", description="Команды и примеры"),
             BotCommand(command="docs", description="Мои документы"),
             BotCommand(command="ask", description="Вопрос по выбранным файлам"),
+            BotCommand(command="chart", description="Построить график в Excel"),
             BotCommand(command="report", description="Сводка поступлений и расходов"),
             BotCommand(command="ledger", description="Журнал в Excel"),
             BotCommand(command="privacy", description="Хранение и внешняя обработка"),

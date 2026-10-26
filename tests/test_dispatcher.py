@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 from ai_service import AIService
 from bot import AccessMiddleware, Application
 from config import Settings
+from domain import DocumentData, TableData
 from storage import Repository
 
 
@@ -67,7 +68,21 @@ async def test_commands_route_and_money_persists(tmp_path):
         workbook = load_workbook(BytesIO(session.calls[-1].document.data))
         assert workbook["Проводки"]["H1"].value == "ID записи"
         assert workbook["Проводки"].max_row == 4
-        await command("/report", 6, owner=456)
+        await command("/menu", 6)
+        assert session.calls[-2].reply_markup.keyboard
+        assert any(button.text == "Построить график"
+                   for row in session.calls[-2].reply_markup.keyboard for button in row)
+        data = DocumentData(title="Fixture", text="", warnings=[], tables=[
+            TableData(name="Расходы", columns=["Категория", "Сумма"],
+                      rows=[["Аренда", "100.00"], ["Связь", "20.00"]])
+        ])
+        doc_id = repo.add_document(123, "fixture.csv", data)
+        await command(f"/chart {doc_id} 1 1 2", 7)
+        chart_book = load_workbook(BytesIO(session.calls[-1].document.data))
+        assert len(chart_book["График"]._charts) == 1
+        await command("Мои документы", 8)
+        assert "fixture.csv" in session.calls[-1].text
+        await command("/report", 9, owner=456)
         assert "Доступ закрыт" in session.calls[-1].text
         assert repo.summary(456) == {}
     finally:
